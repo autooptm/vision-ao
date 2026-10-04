@@ -50,6 +50,7 @@ class Opt3:
 
     def __init__(self, model, criterion, optimizer, image, target, opt_10=None, warmup=3):
         self.opt_10 = opt_10
+        self.opt_11 = [group["lr"] for group in optimizer.param_groups]
         self.opt_6 = torch.empty_like(image)
         self.opt_7 = torch.empty_like(target)
         self.opt_6.copy_(image)
@@ -94,6 +95,9 @@ class Opt3:
         loss.backward()
         optimizer.step()
         return output, loss
+
+    def stale(self, optimizer):
+        return self.opt_11 != [group["lr"] for group in optimizer.param_groups]
 
     def __call__(self, image, target):
         if image.shape != self.opt_6.shape:
@@ -166,6 +170,9 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
     header = f"Epoch: [{epoch}]"
     pending, block_start = [], time.time()
     opt_10 = torch.bfloat16 if "opt2" in fast else None
+    if opt_4 is not None and opt_4["step"] is not None and opt_4["step"].stale(optimizer):
+        # the schedule moved the learning rate the step was built with: build it again
+        opt_4["step"] = None
     for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
         start_time = time.time()
         image = image.to(device, non_blocking=True)
@@ -189,7 +196,9 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
                 output = model(image)
                 loss = criterion(output, target)
 
-            optimizer.zero_grad()
+            # a built step keeps using the gradient tensors it was built on:
+            # zero them in place, as it does, instead of dropping them
+            optimizer.zero_grad(set_to_none=step is None)
             if scaler is not None:
                 scaler.scale(loss).backward()
                 if args.clip_grad_norm is not None:
@@ -730,9 +739,12 @@ def get_args_parser(add_help=True):
     parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
     parser.add_argument(
         "--fast",
+        nargs="?",
+        const=",".join(FAST_OPTIONS),
         default=",".join(FAST_OPTIONS),
         type=str,
-        help="[autooptm] comma-separated options, all on by default: "
+        metavar="OPTIONS",
+        help="[autooptm] comma-separated options, all on by default and with a bare --fast: "
         + ", ".join(FAST_OPTIONS)
         + ". Pass --fast '' to restore the stock path exactly, or drop any single option "
         "from the list. `opt1` and `opt2` are disabled automatically when --amp, "

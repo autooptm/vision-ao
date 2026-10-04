@@ -33,7 +33,7 @@ index 8653957..0e9bcdd 100644
              transforms.append(T.RandomErasing(p=random_erase_prob))
  
 diff --git a/references/classification/train.py b/references/classification/train.py
-index d52124f..32bc529 100644
+index d52124f..ff23369 100644
 --- a/references/classification/train.py
 +++ b/references/classification/train.py
 @@ -1,5 +1,7 @@
@@ -44,7 +44,7 @@ index d52124f..32bc529 100644
  import time
  import warnings
  
-@@ -15,35 +17,192 @@ from torch.utils.data.dataloader import default_collate
+@@ -15,35 +17,201 @@ from torch.utils.data.dataloader import default_collate
  from torchvision.transforms.functional import InterpolationMode
  from transforms import get_mixup_cutmix
  
@@ -81,6 +81,7 @@ index d52124f..32bc529 100644
 +
 +    def __init__(self, model, criterion, optimizer, image, target, opt_10=None, warmup=3):
 +        self.opt_10 = opt_10
++        self.opt_11 = [group["lr"] for group in optimizer.param_groups]
 +        self.opt_6 = torch.empty_like(image)
 +        self.opt_7 = torch.empty_like(target)
 +        self.opt_6.copy_(image)
@@ -125,6 +126,9 @@ index d52124f..32bc529 100644
 +        loss.backward()
 +        optimizer.step()
 +        return output, loss
++
++    def stale(self, optimizer):
++        return self.opt_11 != [group["lr"] for group in optimizer.param_groups]
 +
 +    def __call__(self, image, target):
 +        if image.shape != self.opt_6.shape:
@@ -198,6 +202,9 @@ index d52124f..32bc529 100644
      header = f"Epoch: [{epoch}]"
 +    pending, block_start = [], time.time()
 +    opt_10 = torch.bfloat16 if "opt2" in fast else None
++    if opt_4 is not None and opt_4["step"] is not None and opt_4["step"].stale(optimizer):
++        # the schedule moved the learning rate the step was built with: build it again
++        opt_4["step"] = None
      for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
          start_time = time.time()
 -        image, target = image.to(device), target.to(device)
@@ -239,7 +246,9 @@ index d52124f..32bc529 100644
 +                output = model(image)
 +                loss = criterion(output, target)
 +
-+            optimizer.zero_grad()
++            # a built step keeps using the gradient tensors it was built on:
++            # zero them in place, as it does, instead of dropping them
++            optimizer.zero_grad(set_to_none=step is None)
 +            if scaler is not None:
 +                scaler.scale(loss).backward()
 +                if args.clip_grad_norm is not None:
@@ -256,7 +265,7 @@ index d52124f..32bc529 100644
  
          if model_ema and i % args.model_ema_steps == 0:
              model_ema.update_parameters(model)
-@@ -53,13 +212,23 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
+@@ -53,13 +221,23 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
  
          acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
          batch_size = image.shape[0]
@@ -285,7 +294,7 @@ index d52124f..32bc529 100644
      model.eval()
      metric_logger = utils.MetricLogger(delimiter="  ")
      header = f"Test: {log_suffix}"
-@@ -69,6 +238,8 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
+@@ -69,6 +247,8 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
          for image, target in metric_logger.log_every(data_loader, print_freq, header):
              image = image.to(device, non_blocking=True)
              target = target.to(device, non_blocking=True)
@@ -294,7 +303,7 @@ index d52124f..32bc529 100644
              output = model(image)
              loss = criterion(output, target)
  
-@@ -147,6 +318,7 @@ def load_data(traindir, valdir, args):
+@@ -147,6 +327,7 @@ def load_data(traindir, valdir, args):
                  augmix_severity=augmix_severity,
                  backend=args.backend,
                  use_v2=args.use_v2,
@@ -302,7 +311,7 @@ index d52124f..32bc529 100644
              ),
          )
          if args.cache_dataset:
-@@ -202,6 +374,7 @@ def load_data(traindir, valdir, args):
+@@ -202,6 +383,7 @@ def load_data(traindir, valdir, args):
  
  
  def main(args):
@@ -310,7 +319,7 @@ index d52124f..32bc529 100644
      if args.output_dir:
          utils.mkdir(args.output_dir)
  
-@@ -216,6 +389,7 @@ def main(args):
+@@ -216,6 +398,7 @@ def main(args):
      else:
          torch.backends.cudnn.benchmark = True
  
@@ -318,7 +327,7 @@ index d52124f..32bc529 100644
      train_dir = os.path.join(args.data_path, "train")
      val_dir = os.path.join(args.data_path, "val")
      dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir, args)
-@@ -232,6 +406,13 @@ def main(args):
+@@ -232,6 +415,13 @@ def main(args):
      else:
          collate_fn = default_collate
  
@@ -332,7 +341,7 @@ index d52124f..32bc529 100644
      data_loader = torch.utils.data.DataLoader(
          dataset,
          batch_size=args.batch_size,
-@@ -239,14 +420,21 @@ def main(args):
+@@ -239,14 +429,21 @@ def main(args):
          num_workers=args.workers,
          pin_memory=True,
          collate_fn=collate_fn,
@@ -355,7 +364,7 @@ index d52124f..32bc529 100644
  
      if args.distributed and args.sync_bn:
          model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-@@ -274,6 +462,7 @@ def main(args):
+@@ -274,6 +471,7 @@ def main(args):
              momentum=args.momentum,
              weight_decay=args.weight_decay,
              nesterov="nesterov" in opt_name,
@@ -363,7 +372,7 @@ index d52124f..32bc529 100644
          )
      elif opt_name == "rmsprop":
          optimizer = torch.optim.RMSprop(
-@@ -360,16 +549,26 @@ def main(args):
+@@ -360,16 +558,26 @@ def main(args):
              evaluate(model, criterion, data_loader_test, device=device)
          return
  
@@ -394,7 +403,7 @@ index d52124f..32bc529 100644
          if args.output_dir:
              checkpoint = {
                  "model": model_without_ddp.state_dict(),
-@@ -382,9 +581,18 @@ def main(args):
+@@ -382,9 +590,18 @@ def main(args):
                  checkpoint["model_ema"] = model_ema.state_dict()
              if scaler:
                  checkpoint["scaler"] = scaler.state_dict()
@@ -415,15 +424,18 @@ index d52124f..32bc529 100644
      total_time = time.time() - start_time
      total_time_str = str(datetime.timedelta(seconds=int(total_time)))
      print(f"Training time {total_time_str}")
-@@ -520,6 +728,16 @@ def get_args_parser(add_help=True):
+@@ -520,6 +737,19 @@ def get_args_parser(add_help=True):
      parser.add_argument("--weights", default=None, type=str, help="the weights enum name to load")
      parser.add_argument("--backend", default="PIL", type=str.lower, help="PIL or tensor - case insensitive")
      parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
 +    parser.add_argument(
 +        "--fast",
++        nargs="?",
++        const=",".join(FAST_OPTIONS),
 +        default=",".join(FAST_OPTIONS),
 +        type=str,
-+        help="[autooptm] comma-separated options, all on by default: "
++        metavar="OPTIONS",
++        help="[autooptm] comma-separated options, all on by default and with a bare --fast: "
 +        + ", ".join(FAST_OPTIONS)
 +        + ". Pass --fast '' to restore the stock path exactly, or drop any single option "
 +        "from the list. `opt1` and `opt2` are disabled automatically when --amp, "
